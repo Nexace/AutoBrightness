@@ -68,3 +68,14 @@ ROUND 2 (panel moved into a --panel child process; resident icon process measure
   RESULT: the 8.00 MB target still FAILS (best post-interaction lifetime peak 8.848 MB), at the measured floor for a status-item process on this macOS.
   Unit checks added: production spawn path (stub child), icon click closes an open panel child, failed click passes its message to the panel, quit exit status, panel child placement/message.
   Not verified: a real right-click opening the panel child (the spawn is exercised through showOptions in --selftest, not by a physical click) and clicking Quit inside a real panel child.
+
+SYNC WITH SYSTEM SETTINGS (user-reported: icon and Settings switch disagreed)
+  Reproduced with System Settings → Displays open (driven via accessibility, setting restored afterwards):
+    - outside change (API) → Settings warning text updates, Settings switch stays stale even after switching panes; reactivating Settings shows the right value.
+    - Settings switch click → API reads the same value (AutoBrightness' backend and Settings agree).
+    - the icon never changed until the next click (no polling, no notification available — see research/Backend.md).
+  Fix: quiet re-reads on launch, pointer-enter, app activation, and once a second only while System Settings is frontmost; panel child re-reads every second.
+  Live trace (AUTOBRIGHTNESS_TRACE=1, normal LaunchServices launch): outside flip with Finder frontmost → no change until Settings is activated (catch-up read);
+    flips while Settings frontmost followed within ~0.3–0.4 s; flip while Finder frontmost again not followed. Panel child followed two outside flips within ~1 s.
+  Unit checks added: quiet refresh follows outside changes without dimming, keeps a failure explanation, hover re-reads.
+  Not fixable: the Settings switch itself following outside changes.

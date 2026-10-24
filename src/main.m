@@ -198,6 +198,8 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
 @property AutoState state;
 @property (copy) NSString *message; // why unsupported, or why the last read/write failed
 @property BOOL working;
+@property BOOL posted,postedOn;
+@property AutoState postedState;
 @property (strong) id rasterSurface;
 @end
 @implementation AutoView
@@ -257,6 +259,8 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
 @property BOOL expected;
 @property id signalSources;
 @property AutoState iconState;
+@property NSInteger postedIconState;
+@property NSTimer *settingsTimer;
 @property BOOL inProcessPanel; // verify/profile/tests and the --panel child build the panel here; the icon process spawns it
 @property NSTask *panelTask;
 @property NSArray<NSString *> *panelArguments; // set only in the panel child (`--panel`)
@@ -288,7 +292,7 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     self.item.button.accessibilityCustomActions=@[[[NSAccessibilityCustomAction alloc]initWithName:@"Show options" target:self selector:@selector(showOptions:)]];
     self.item.autosaveName=@"AutoBrightness";self.item.visible=YES;
     [self.item.button addTrackingArea:[[NSTrackingArea alloc]initWithRect:NSZeroRect options:NSTrackingMouseEnteredAndExited|NSTrackingActiveAlways|NSTrackingInVisibleRect owner:self userInfo:nil]];
-    if(!self.verifying && !self.profiling && !self.selftest)[self registerLoginItem];
+    if(!self.verifying && !self.profiling && !self.selftest){[self registerLoginItem];[self watchSettings];}
     [self updateIcon];[self refresh]; // the icon must show the real setting from the start
     if(self.verifying || self.profiling || self.selftest) {
         [self performSelector:self.selftest?@selector(beginSelftest):self.profiling?@selector(profileOpen):@selector(beginVerification) withObject:nil afterDelay:3];
@@ -322,7 +326,7 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     v.toggle.on=v.state==AutoOn;v.toggle.enabled=(v.state==AutoOn||v.state==AutoOff)&&!self.busy;
     v.toggle.valueText=v.state==AutoOn?@"On":v.state==AutoOff?@"Off":@"Unavailable";
     v.needsDisplay=YES;
-    NSAccessibilityPostNotification(v.toggle,NSAccessibilityValueChangedNotification);
+    if(!v.posted||v.postedOn!=v.toggle.on||v.postedState!=v.state){v.posted=YES;v.postedOn=v.toggle.on;v.postedState=v.state;NSAccessibilityPostNotification(v.toggle,NSAccessibilityValueChangedNotification);}
     if(!self.busy && self.panel.visible && self.panel.isKeyWindow) { // keep focus put while a change is in flight
         NSResponder *current=self.panel.firstResponder;
         if(!current || ![current isKindOfClass:PanelControl.class] || !((PanelControl *)current).acceptsFirstResponder)
@@ -333,7 +337,9 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     if(!message&&self.pendingMessage){message=self.pendingMessage;} // a failure the icon process wants explained
     self.pendingMessage=nil;self.lastMessage=message;
     self.busy=NO;self.view.working=NO;self.view.message=message;
-    self.iconState=unsupported?AutoUnsupported:!known?AutoUnreadable:enabled?AutoOn:AutoOff;
+    AutoState state=unsupported?AutoUnsupported:!known?AutoUnreadable:enabled?AutoOn:AutoOff;
+    if(getenv("AUTOBRIGHTNESS_TRACE")&&state!=self.iconState){fprintf(stderr,"[%.2f] icon state %ld -> %ld\n",CFAbsoluteTimeGetCurrent()-978307200.0,(long)self.iconState,(long)state);fflush(stderr);}
+    self.iconState=state;
     self.view.state=self.iconState;
     [self updateIcon];[self render];
 }
@@ -345,7 +351,7 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     NSButton *button=self.item.button;button.image=images[variant];
     NSString *state=self.iconState==AutoOn?@"On":self.iconState==AutoOff?@"Off":@"Unavailable";
     button.accessibilityValueDescription=state;
-    if(button)NSAccessibilityPostNotification(button,NSAccessibilityValueChangedNotification);
+    if(button&&self.postedIconState!=(NSInteger)self.iconState){self.postedIconState=self.iconState;NSAccessibilityPostNotification(button,NSAccessibilityValueChangedNotification);}
     button.accessibilityHelp=self.hoverLines[2];
 }
 // Left click changes the setting directly; right/Control click, or the accessibility action, opens the panel.
@@ -362,13 +368,16 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
 }
 - (BOOL)showOptions:(id)sender { (void)sender;[self openPanel:YES];return YES; }
 // Reads on a background queue: the system service may be slow, and the menu bar must never hang.
-- (void)refresh {
+- (void)refresh { [self refreshQuietly:NO]; }
+// A quiet refresh (timers, hover, app switches) does not dim the controls while it reads.
+- (void)refreshQuietly:(BOOL)quiet {
     if(self.busy)return;self.busy=YES;
-    [self render];
+    if(!quiet)[self render];
     dispatch_async(self.queue,^{
         BOOL enabled=NO,unsupported=NO;NSString *issue=LoadSystemBackend();
         if(issue)unsupported=YES;else issue=ReadAuto(FindDisplay(),&enabled,&unsupported);
-        dispatch_async(dispatch_get_main_queue(),^{[self apply:enabled message:issue unsupported:unsupported known:issue==nil];});
+        // A quiet re-read must not wipe the explanation of a change that failed; only the next change does.
+        dispatch_async(dispatch_get_main_queue(),^{[self apply:enabled message:issue?:(quiet?self.lastMessage:nil) unsupported:unsupported known:issue==nil];});
     });
 }
 // flip=YES toggles whatever macOS has right now; otherwise sets `on`. A change made while another
@@ -400,6 +409,24 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     (void)sender;if(self.panelOpen){[self closePanel:nil];return;}
     [self openPanel:YES];
 }
+#pragma mark - Staying in sync with System Settings
+// macOS sends apps no change notification for this setting (System Settings itself re-reads it about
+// twice a second while its Displays pane is up), so the icon re-reads it: once when the pointer reaches
+// the icon, whenever another app becomes active, and every second only while System Settings is in front.
+- (void)watchSettings {
+    [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(frontAppChanged:) name:NSWorkspaceDidActivateApplicationNotification object:nil];
+    [self frontAppChanged:nil];
+}
+- (void)frontAppChanged:(NSNotification *)note {
+    BOOL settings=[NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier isEqual:@"com.apple.systempreferences"];
+    if(settings&&!self.settingsTimer) {
+        self.settingsTimer=[NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(quietRefresh) userInfo:nil repeats:YES];
+        self.settingsTimer.tolerance=.25;
+    } else if(!settings&&self.settingsTimer){[self.settingsTimer invalidate];self.settingsTimer=nil;}
+    if(note)[self refreshQuietly:YES];
+}
+- (void)quietRefresh { [self refreshQuietly:YES]; }
+
 #pragma mark - Panel process
 - (BOOL)panelOpen { return self.panelTask!=nil || self.panel.visible; }
 // The panel lives in a short-lived copy of this executable (`--panel`) so its window and drawing
@@ -450,6 +477,7 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
 }
 - (void)mouseEntered:(NSEvent *)event {
     (void)event;[self hideHover];
+    [self refreshQuietly:YES]; // the pointer is on its way to the icon: make sure it shows the real setting
     if(!self.panelOpen)[self performSelector:@selector(showHover) withObject:nil afterDelay:.5];
 }
 - (void)mouseExited:(NSEvent *)event { (void)event;[self hideHover]; }
@@ -508,6 +536,8 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     [self openPanel:YES];
     // Clicks on the icon belong to the icon process, which closes this panel itself.
     __weak AutoApp *weakSelf=self;
+    // The open panel keeps up with changes made elsewhere (e.g. in System Settings).
+    self.settingsTimer=[NSTimer scheduledTimerWithTimeInterval:1 target:self selector:@selector(quietRefresh) userInfo:nil repeats:YES];self.settingsTimer.tolerance=.25;
     [NSEvent removeMonitor:self.globalMonitor];
     self.globalMonitor=[NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown|NSEventMaskRightMouseDown handler:^(NSEvent *e){(void)e;
         if(!NSPointInRect(NSEvent.mouseLocation,NSInsetRect(weakSelf.forcedAnchor,-2,-2)))[weakSelf closePanel:nil];}];

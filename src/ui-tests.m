@@ -179,6 +179,19 @@ int main(void) { @autoreleasepool {
     Settle(child); assert([child.view.message isEqual:@"Test failure"] && child.view.state == AutoOn);
     child.panelArguments = nil; [child closePanel:nil]; assert(!child.panel.visible);
 
+    // Staying in sync: a quiet re-read follows outside changes without dimming, and keeps a failure message.
+    FakeByte = 1; [app refresh]; Settle(app); assert(app.iconState == AutoOn);
+    FakeByte = 0; [app refreshQuietly:YES]; assert(app.busy && view.toggle.enabled); Settle(app); // no dimming while reading
+    assert(app.iconState == AutoOff && !view.toggle.on && view.state == AutoOff);
+    FakeByte = 1; [app refreshQuietly:YES]; Settle(app); assert(app.iconState == AutoOn && view.toggle.on);
+    FakeSetResult = (int)0xe00002bc; [app change:NO to:NO]; Settle(app); assert(view.message);
+    [app closePanel:nil]; FakeSetResult = 0;
+    [app refreshQuietly:YES]; Settle(app); assert(view.message && app.iconState == AutoOn); // failure explanation survives a quiet read
+    [app change:NO to:NO]; Settle(app); assert(!view.message && app.iconState == AutoOff); // the next change clears it
+    [app change:NO to:YES]; Settle(app); assert(app.iconState == AutoOn);
+    FakeByte = 0; [app mouseEntered:nil]; Pump(^BOOL{ return app.iconState == AutoOff; }); [app mouseExited:nil]; // hover re-reads
+    FakeByte = 1; [app refresh]; Settle(app);
+
     // Panel placement and dismissal: Escape, outside click, and the status item toggle.
     [app togglePanel:nil]; assert(app.panel.visible);
     NSRect frame = app.panel.frame, visible = app.panel.screen.visibleFrame;

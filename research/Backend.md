@@ -29,9 +29,16 @@ Readback is the getter called again after a write. It was cross-checked three in
 
 Verified on exactly the machine above. The app refuses (shows an unsupported state, never an enabled switch) when: not arm64, the framework or any symbol is missing, no built-in display is active, `Has…` is false (no ambient light sensor), the getter fails, or it leaves its out byte unwritten / writes anything but 0 or 1 (the byte is pre-set to `0xAA` to detect an ABI mismatch). A write counts only if the setter returns 0 **and** an independent read returns the requested value. Other macOS versions or Macs are untested; the guards turn a changed ABI into an error rather than a wrong answer, but an update that keeps the same signatures and changes their meaning could not be detected.
 
-## Notifications
+## Notifications (investigated again; none usable)
 
-`DisplayServicesRegisterForAmbientLightCompensationNotifications(a, b, c)` forwards to `DisplayServicesAddNotification` with the name `DisplayServicesAmbientBrightness`. That name is the **ambient light level**, not the on/off setting, so it would wake the app on every lux change and would not report a change made in System Settings. Not used. The app refreshes on launch, when the panel opens, and on every menu bar click (which reads the real value before flipping it). Consequence: if the setting is changed elsewhere, the icon can be stale until the next click or panel open; a click still flips the *real* value.
+- `DisplayServicesRegisterForAmbientLightCompensationNotifications(display, context, callback)` returns 0 but its callback never fired in a 40 s test that toggled the setting from another process (and the registered name is `DisplayServicesAmbientBrightness`, the light level).
+- `BrightnessSystemClient` (CoreBrightness, private ObjC) has `registerNotificationBlock:forProperties:`, `registerNotificationForKeys:` and display variants. Registering for `DisplayBrightnessAuto`, `CBAutoBrightnessEnabled` and `DisplayServicesAmbientLightCompensationEnabled` through four API combinations delivered zero callbacks while the setting was toggled externally. `copyPropertyForKey:@"DisplayBrightnessAuto"` does read the value.
+- `corebrightnessd` logs show the daemon itself raises `CBAutoBrightnessEnabled` / `DisplayBrightnessAuto` notifications for every change, whether made through the DisplayServices setter or System Settings' switch, but they are not delivered to an ordinary client.
+- System Settings re-reads properties from the daemon (`clientCopyPropertyWithKey`) about every 0.6 s while its Displays pane is visible. That is polling too.
+
+Observed System Settings behavior: after an outside change its warning text ("Energy usage may be higher…") appears or disappears immediately, but the switch keeps its old position until the pane is reactivated; it is not an AutoBrightness bug.
+
+So the app re-reads on a few events and, only while System Settings is frontmost, once a second (see README).
 
 ## Research safety
 

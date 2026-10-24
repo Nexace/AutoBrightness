@@ -16,7 +16,9 @@ Open **AutoBrightness.app**. A sun appears in the menu bar:
 
 Every change is confirmed by reading the setting back from macOS before the icon or switch moves, and a second change is ignored while one is in flight. macOS does the ambient light sensing itself; the app does nothing in the background. It asks for no Accessibility, Screen Recording or administrator permission and makes no network requests. There is no helper process: the only other processes are short-lived hover-label and panel children, second launches of the same executable that exit when closed. It controls only this one setting for the built-in display — no keyboard backlight, True Tone, Night Shift, external displays, schedules, thresholds or brightness slider.
 
-The icon reflects the setting as of launch, the last panel open, or the last click. There is no polling, so a change made in System Settings shows up on the next click or panel open (a click always flips the real current value).
+**Staying in sync.** macOS sends apps no change notification for this setting (System Settings itself re-reads it about twice a second while its Displays pane is open), so the icon re-reads it at the moments it could have changed: at launch, when the pointer reaches the icon, whenever another app becomes active, and **once a second only while System Settings is the frontmost app**. An open panel also re-reads every second. Nothing runs otherwise, and a click always flips the real current value. A change made in System Settings therefore shows on the icon within about a second.
+
+The reverse is not fully possible: System Settings' own switch does not follow outside changes (from AutoBrightness or anything else) while its Displays pane stays open. Its warning text under the switch updates live, but the switch itself refreshes only when Settings is reopened or reactivated. That is System Settings' behavior, not something an app can change.
 
 ## Runs in the background, starts at login
 
