@@ -58,4 +58,4 @@ Idle CPU over 20 s: about 0.003% of one core (0.6 ms), a few non-periodic wakeup
 
 ## Files
 
-`src/auto.h` backend (load, read, write with readback) · `src/main.m` app, status item, panel, verification modes · `src/tests.m`, `src/ui-tests.m`, `src/fake.h` checks · `research/` backend and memory notes, probes · `artwork/draw-icon.m` icon · `graphify-out/` code graph (code only; docs not extracted).
+`src/auto.h` backend (load, read, write with readback) · `src/main.m` app, status item, panel, verification modes · `src/tests.m`, `src/ui-tests.m`, `src/fake.h` checks · `research/` backend and memory notes, probes · `artwork/draw-icon.m` icon. MIT licensed (`LICENSE`).

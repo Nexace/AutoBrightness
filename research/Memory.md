@@ -35,14 +35,14 @@ The four process-local flags lowered the real peak by 6.5 MB, so they ship in `I
 
 - Single `NSStatusItem`, single process, no timers; backend work runs on one serial dispatch queue.
 - The panel (window, one IOSurface at backing scale, SkyLight blur) is created on right-click and **freed when it closes**; an ordinary left-click toggle never builds it.
-- All controls paint into the panel's one surface; they have no layers' backing stores of their own. No `NSVisualEffectView` unless the private blur is unavailable (an `NSVisualEffectView` hierarchy cost ~88 MB of graphics memory in ChargeCap's investigation).
+- All controls paint into the panel's one surface; they have no layers' backing stores of their own. No `NSVisualEffectView` unless the private blur is unavailable (an `NSVisualEffectView` hierarchy cost ~88 MB of graphics memory in an earlier sibling project's investigation).
 - Panel open adds about 1.2 MB over idle; repeated reopen adds ~0.1 MB each.
 
-Not tried because the brief forbids it: a second short-lived process for the panel (as ScrollToggle does). It would not help the launch peak, which is already 8.14 MB.
+(Early note, superseded: a second short-lived process for the panel was first ruled out, then built in round 2 below once it was clear the in-process panel was the largest cost.)
 
 ## Hover label (Liquid Glass)
 
-`NSGlassEffectView` shown inside the icon process added about 5.5 MB (with the allocator flags) and did not give it back after the label closed, even with `malloc_zone_pressure_relief`. The label is therefore drawn by a short-lived second launch of the executable (`--hover`, no lock, no status item), as ScrollToggle does. The child measures about 14 MB while it exists and exits by itself after 8 s or when the icon process terminates it; the icon process footprint is unchanged by showing it (9.094 MB before, 9.110 MB after in `--verify`). Hover bookkeeping and the tracking area cost the icon process roughly 0.3 MB at launch (installed plain launch 8.18–8.39 MB vs 7.85 MB before).
+`NSGlassEffectView` shown inside the icon process added about 5.5 MB (with the allocator flags) and did not give it back after the label closed, even with `malloc_zone_pressure_relief`. The label is therefore drawn by a short-lived second launch of the executable (`--hover`, no lock, no status item), the same approach another menu bar utility of mine uses. The child measures about 14 MB while it exists and exits by itself after 8 s or when the icon process terminates it; the icon process footprint is unchanged by showing it (9.094 MB before, 9.110 MB after in `--verify`). Hover bookkeeping and the tracking area cost the icon process roughly 0.3 MB at launch (installed plain launch 8.18–8.39 MB vs 7.85 MB before).
 
 ## Round 2: finding the floor (status item alone)
 
