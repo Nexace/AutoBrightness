@@ -43,3 +43,28 @@ Not tried because the brief forbids it: a second short-lived process for the pan
 ## Hover label (Liquid Glass)
 
 `NSGlassEffectView` shown inside the icon process added about 5.5 MB (with the allocator flags) and did not give it back after the label closed, even with `malloc_zone_pressure_relief`. The label is therefore drawn by a short-lived second launch of the executable (`--hover`, no lock, no status item), as ScrollToggle does. The child measures about 14 MB while it exists and exits by itself after 8 s or when the icon process terminates it; the icon process footprint is unchanged by showing it (9.094 MB before, 9.110 MB after in `--verify`). Hover bookkeeping and the tracking area cost the icon process roughly 0.3 MB at launch (installed plain launch 8.18–8.39 MB vs 7.85 MB before).
+
+## Round 2: finding the floor (status item alone)
+
+Interleaved A/B on a 20-line AppKit accessory app, same allocator flags, n = 3–6 per arm (footprint MB; the whole system drifts by ±0.3 MB over minutes, so only interleaved comparisons count):
+
+| Variant | Footprint |
+|---|---|
+| no window, no status item | 5.30 |
+| one borderless window (no status item) | 7.47 |
+| one `NSStatusItem` with template image | 8.67 |
+| + `registerDefaults` (ApplePersistenceIgnoreState, NSQuitAlwaysKeepsWindows, …) | 8.65 vs 8.59 base — no effect |
+| + `OS_ACTIVITY_MODE=disable` | 8.87 vs 8.78 — no effect |
+| + AppKit text/autofill/spelling defaults via argv | 8.67 vs 8.62 — no effect |
+| + `malloc_zone_pressure_relief` 1.5 s after launch | 8.70 vs 8.63 — no effect |
+| + loading DisplayServices and reading the setting | 8.68 vs 8.81 — no measurable cost |
+| + autosaveName / accessibility label / tracking area | within noise |
+| title text instead of image | not lower (8.9 vs 8.6) |
+
+The first window costs ~2.2 MB (Metal/AGX driver and CoreAnimation context load on first use) and the status item another ~1.2 MB; `malloc_history` charges 0.7 MB of heap to `NSApplication` creation, 1.2 MB to creating the status item and 1.4 MB to the run loop start. AppKit on this macOS maps ~930 images at launch (AppIntents, CoreSpotlight, CloudKit, GenerativeModels, …) with delayed initializers, and a batch of Siri/Spotlight frameworks is touched after the first window. None of that is controllable from the app.
+
+The shipped app measured 8.43 / 8.77 (footprint / peak) against 8.65 / 8.91 for the equivalent minimal app in the same interleaved run, i.e. at or slightly below the floor.
+
+## Round 2: what did help
+
+Moving the panel (window, 684 KB drawing surface, SkyLight blur) out of the icon process into a `--panel` child. Icon process after a full interaction (`--selftest`, normal LaunchServices launch): footprint 8.668–8.684 MB, lifetime peak 8.848–9.028 MB, versus 9.4 MB / 10.5–10.6 MB when the panel was built in-process (`--verify`). The panel child is ~14 MB while open and exits on close; total system memory while the panel is open is therefore higher, not lower — only the always-running process shrank. Quitting from the panel exits the child with status 3, which the icon process turns into a normal quit.

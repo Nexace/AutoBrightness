@@ -57,3 +57,14 @@ FINAL BUILD AFTER HOVER/LOGIN CHANGES
      idle 9.094 / after use 9.438 / lifetime peak 10.634 MB — 8.00 MB target FAILS.
   Installed plain launches, 6 s then 20 s idle: footprint 8.18–8.39 MB, lifetime peak 8.46–8.62 MB (some runs after a fresh install or with system activity
   showed 9.8 MB / up to 11.2 MB). CPU 0.0025–0.0034% (0.5–0.7 ms per 20 s); one run during system activity 0.30% (60 ms).
+
+ROUND 2 (panel moved into a --panel child process; resident icon process measured with --selftest, LaunchServices launch, original = off)
+  --selftest: menu bar clicks on/off verified by independent read; hover child ran; panel child opened, stayed up, closed on request three times; original restored and read back.
+     run 1: idle 8.717 / after use 8.684 / lifetime peak 9.028 MB
+     run 2: idle 8.635 / after use 8.668 / lifetime peak 8.848 MB
+     earlier run (before final tidy): 9.159 / 8.684 / 9.356 MB
+  --verify (in-process panel harness, keyboard/accessibility/clicks, busy guard): all verified, restored; idle 9.012 / after 9.405 / peak 10.552 MB (not the shipped configuration).
+  Interleaved comparison with an equivalent minimal AppKit status-item app (5 runs each): shipped app 8.432 / peak 8.766 MB; minimal app 8.645 / peak 8.907 MB.
+  RESULT: the 8.00 MB target still FAILS (best post-interaction lifetime peak 8.848 MB), at the measured floor for a status-item process on this macOS.
+  Unit checks added: production spawn path (stub child), icon click closes an open panel child, failed click passes its message to the panel, quit exit status, panel child placement/message.
+  Not verified: a real right-click opening the panel child (the spawn is exercised through showOptions in --selftest, not by a physical click) and clicking Quit inside a real panel child.

@@ -11,10 +11,10 @@ Open **AutoBrightness.app**. A sun appears in the menu bar:
 - **Left-click:** turn automatic brightness on or off immediately.
 - **Filled sun:** on. **Outline sun:** off. A faded outline means the setting can't be read or isn't available.
 - **Hover:** rest the pointer on the icon for half a second and a small native Liquid Glass label (Apple's system font and text styles) shows the name, the current state and what a click does. It disappears when the pointer leaves, on click, or after eight seconds. It is drawn by a short-lived copy of the same executable (`--hover`) so the Liquid Glass memory stays out of the icon process; Reduce Transparency gives an opaque card instead.
-- **Right-click** (or Control-click, or the VoiceOver "Show options" action): a frosted panel opens under the icon with the **Automatic brightness** switch, a short explanation, **Displays Settings…** and **Quit**. Click outside, press Escape, or click the icon again to dismiss it. Space or Return operates the focused control, Tab moves between them.
+- **Right-click** (or Control-click, or the VoiceOver "Show options" action): a frosted panel (its own short-lived process, so it never grows the icon process) opens under the icon with the **Automatic brightness** switch, a short explanation, **Displays Settings…** and **Quit**. Click outside, press Escape, or click the icon again to dismiss it. Space or Return operates the focused control, Tab moves between them.
 - If a left-click can't change the setting, or the Mac has no ambient light sensor, the panel opens and says why. On an unsupported Mac there is no switch, only a button that opens Displays settings.
 
-Every change is confirmed by reading the setting back from macOS before the icon or switch moves, and a second change is ignored while one is in flight. macOS does the ambient light sensing itself; the app does nothing in the background. It asks for no Accessibility, Screen Recording or administrator permission and makes no network requests. There is no helper process: the only other process is the short-lived hover label, a second launch of the same executable. It controls only this one setting for the built-in display — no keyboard backlight, True Tone, Night Shift, external displays, schedules, thresholds or brightness slider.
+Every change is confirmed by reading the setting back from macOS before the icon or switch moves, and a second change is ignored while one is in flight. macOS does the ambient light sensing itself; the app does nothing in the background. It asks for no Accessibility, Screen Recording or administrator permission and makes no network requests. There is no helper process: the only other processes are short-lived hover-label and panel children, second launches of the same executable that exit when closed. It controls only this one setting for the built-in display — no keyboard backlight, True Tone, Night Shift, external displays, schedules, thresholds or brightness slider.
 
 The icon reflects the setting as of launch, the last panel open, or the last click. There is no polling, so a change made in System Settings shows up on the next click or panel open (a click always flips the real current value).
 
@@ -39,9 +39,10 @@ Diagnostics on the built executable:
 ./AutoBrightness.app/Contents/MacOS/AutoBrightness --diagnose   # print the setting; changes nothing
 ./AutoBrightness.app/Contents/MacOS/AutoBrightness --profile    # open the panel, reopen it five times; read-only
 ./AutoBrightness.app/Contents/MacOS/AutoBrightness --verify     # LIVE: really toggles the setting, then restores it
+./AutoBrightness.app/Contents/MacOS/AutoBrightness --selftest   # LIVE: the icon process as shipped, via real click/hover/panel-child paths; restores
 ```
 
-`--verify` identifies itself, is never run by `build.sh` or `test.sh`, snapshots the original value, and restores and re-reads it on normal completion, Quit, SIGINT, SIGTERM and SIGHUP (a `kill -9` cannot be intercepted). Measure through LaunchServices with
+`--verify` (panel, keyboard, accessibility, clicks) and `--selftest` (the shipped icon process, the memory figure) identify themselves, is never run by `build.sh` or `test.sh`, snapshots the original value, and restores and re-reads it on normal completion, Quit, SIGINT, SIGTERM and SIGHUP (a `kill -9` cannot be intercepted). Measure through LaunchServices with
 `open -n -W -a AutoBrightness.app --stdout out.txt --args --verify`.
 CPU of an idle normal instance: `xcrun clang -Os research/cpu-measure.c -o /tmp/cpu && /tmp/cpu PID 20`.
 
@@ -51,7 +52,7 @@ Apple documents the setting only as a checkbox; there is no public API. The app 
 
 ## Resource use
 
-**The 8.00 MB footprint target is not met.** Measured through LaunchServices on this Mac: a plain launch (menu bar icon only, setting read) idles at **7.849 MB** with a lifetime peak of **8.144 MB**. After the full `--verify` interaction (panel opened and reopened, keyboard, accessibility and menu-bar-click toggles in both directions) the footprint is **9.209 MB** and the lifetime peak **10.175 MB** (three runs: 10.126–10.241 MB). On this OS an empty accessory app with one `NSStatusItem` already measures 8.08 MB footprint / 8.42 MB peak with the best allocator settings, so a status-item app cannot get under 8 MB here. `research/Memory.md` has the evidence and the allocator A/B; `Verification.log` has the numbers.
+**The 8.00 MB footprint target is not met, and cannot be on this machine.** The icon process (the one that is always running) was cut from a 10.6 MB peak to **8.68 MB after a full interaction** (menu bar clicks in both directions, hover label, three panel open/close cycles; lifetime peak 8.85–9.03 MB, `--selftest`), by moving the panel and hover label into short-lived child processes. But a bare AppKit app that only creates one `NSStatusItem` measures 8.1–8.9 MB at the same moments (8.65 MB footprint / 8.91 MB peak in an interleaved comparison against this app's 8.43 / 8.77): the status item and the first window machinery are a floor that no setting I found moves. `research/Memory.md` has every experiment; `Verification.log` has the numbers. While the panel or hover label is open, its child process adds its own ~14 MB (see Memory.md); it exits when closed.
 
 Idle CPU over 20 s: about 0.003% of one core (0.6 ms), a few non-periodic wakeups. No timers, no polling.
 

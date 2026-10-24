@@ -26,9 +26,10 @@ static uint8_t AlphaAt(NSView *view, CGFloat x, CGFloat y) {
 
 static NSInteger spawns;
 static NSArray *spawned;
-static NSTask *StubSpawn(NSArray<NSString *> *arguments) { // a harmless long-running stand-in for the label child
+static NSTask *StubSpawn(NSArray<NSString *> *arguments, void (^finished)(NSTask *)) { // a harmless long-running stand-in for a child
     spawns++; spawned = arguments;
     NSTask *task = [NSTask new]; task.executableURL = [NSURL fileURLWithPath:@"/bin/sleep"]; task.arguments = @[@"30"];
+    if (finished) task.terminationHandler = finished;
     return [task launchAndReturnError:nil] ? task : nil;
 }
 
@@ -37,7 +38,7 @@ int main(void) { @autoreleasepool {
     FindDisplay = FakeDisplay;
     ResetFake();
     AutoApp *app = [AutoApp new];
-    app.retainPanel = YES;
+    app.retainPanel = YES; app.inProcessPanel = YES;
     [app makePanel];
     AutoView *view = app.view;
     PanelControl *toggle = view.toggle;
@@ -123,7 +124,7 @@ int main(void) { @autoreleasepool {
     app.iconState = AutoOff; assert([app.hoverLines[2] hasPrefix:@"Click to turn on"]);
     app.iconState = AutoUnsupported; assert([app.hoverLines[1] hasSuffix:@"unavailable"] && [app.hoverLines[2] isEqual:@"Right-click for options"]);
     app.iconState = AutoOn;
-    HoverSpawner = StubSpawn;
+    ChildSpawner = StubSpawn;
     [app showHover]; assert(spawns == 1 && app.hoverTask.isRunning && [spawned[0] isEqual:@"--hover"] && spawned.count == 8 && [spawned[5] isEqual:@"AutoBrightness"]);
     NSTask *task = app.hoverTask;
     [app showHover]; assert(spawns == 1); // one label at a time
@@ -137,7 +138,7 @@ int main(void) { @autoreleasepool {
     [app click:NO]; Settle(app); assert(app.iconState == AutoOn && FakeByte == 1); // toggle back
     [app showHover]; [app click:YES]; assert(!app.hoverTask && app.panel.visible); [app closePanel:nil];
     [app showHover]; [app openPanel:NO]; assert(!app.hoverTask); [app closePanel:nil];
-    HoverSpawner = SpawnHover;
+    ChildSpawner = SpawnChild;
     ReduceTransparencyOverride = 0;
     NSPanel *label = [app makeHoverWindow:app.hoverLines midX:500 top:900 minX:0 maxX:1000];
     assert(label.visible && [label.contentView isKindOfClass:NSGlassEffectView.class]); // native Liquid Glass
@@ -152,6 +153,31 @@ int main(void) { @autoreleasepool {
     label = [app makeHoverWindow:app.hoverLines midX:5 top:900 minX:0 maxX:1000]; // clamped to the screen edge
     assert(NSMinX(label.frame) >= 8); [label orderOut:nil];
     ReduceTransparencyOverride = -1;
+
+    // Production path: the icon process never builds the panel; it spawns a child and reacts to its exit.
+    app.inProcessPanel = NO; spawns = 0; ChildSpawner = StubSpawn;
+    [app click:YES]; assert(spawns == 1 && app.panelOpen && !app.panel.visible && [spawned[0] isEqual:@"--panel"] && spawned.count == 9);
+    NSTask *panelTask = app.panelTask;
+    [app showHover]; assert(spawns == 1); // no label while the panel is open
+    [app click:NO]; // clicking the icon again closes the child instead of toggling
+    Pump(^BOOL{ return !panelTask.isRunning && !app.panelTask; }); Settle(app); assert(FakeByte == 1);
+    [app click:YES]; assert(spawns == 2); [app closePanel:nil]; Pump(^BOOL{ return !app.panelTask; });
+    Settle(app); // the exit handler refreshes the icon
+    FakeSetResult = (int)0xe00002bc; [app click:NO]; Settle(app); // a failed click explains itself in the panel
+    assert(spawns == 3 && spawned.count == 10 && [spawned.lastObject length] > 0 && [spawned.lastObject isEqual:app.lastMessage]);
+    [app closePanel:nil]; Pump(^BOOL{ return !app.panelTask; }); FakeSetResult = 0;
+    NSTask *exited = [NSTask new]; exited.executableURL = [NSURL fileURLWithPath:@"/bin/sh"]; exited.arguments = @[@"-c", @"exit 3"];
+    [exited launchAndReturnError:nil]; [exited waitUntilExit]; assert(PanelExitMeansQuit(exited));
+    exited = [NSTask new]; exited.executableURL = [NSURL fileURLWithPath:@"/bin/sh"]; exited.arguments = @[@"-c", @"exit 0"];
+    [exited launchAndReturnError:nil]; [exited waitUntilExit]; assert(!PanelExitMeansQuit(exited));
+    ChildSpawner = SpawnChild; app.inProcessPanel = YES;
+    // The child side: placed under the icon it was told about, shows the failure it was handed, ignores icon clicks.
+    AutoApp *child = [AutoApp new]; child.retainPanel = YES;
+    child.panelArguments = @[@"700", @"900", @"0", @"1440", @"690", @"878", @"22", @"22", @"Test failure"];
+    [child runPanelChild:child.panelArguments]; assert(child.panel.visible && child.hasForcedAnchor);
+    assert(fabs(NSMidX(child.panel.frame) - 701) < 1 && NSMaxY(child.panel.frame) < 900 && child.item == nil);
+    Settle(child); assert([child.view.message isEqual:@"Test failure"] && child.view.state == AutoOn);
+    child.panelArguments = nil; [child closePanel:nil]; assert(!child.panel.visible);
 
     // Panel placement and dismissal: Escape, outside click, and the status item toggle.
     [app togglePanel:nil]; assert(app.panel.visible);

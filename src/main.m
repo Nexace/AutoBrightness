@@ -34,6 +34,16 @@ static BOOL ApplyBackdrop(NSWindow *window) {
     LastBlurError=blur(connection(),(uint32_t)window.windowNumber,ReduceTransparency()?0:36);return LastBlurError==0;
 }
 
+enum { PanelQuitStatus = 3 };
+static BOOL PanelExitMeansQuit(NSTask *task) { return task.terminationReason==NSTaskTerminationReasonExit && task.terminationStatus==PanelQuitStatus; }
+// Short-lived copies of this executable show the hover label and the panel; tests replace the spawner.
+static NSTask *SpawnChild(NSArray<NSString *> *arguments,void(^finished)(NSTask *)) {
+    NSTask *task=[NSTask new];task.executableURL=[NSURL fileURLWithPath:NSBundle.mainBundle.executablePath];task.arguments=arguments;
+    if(finished)task.terminationHandler=finished;
+    NSError *error=nil;return [task launchAndReturnError:&error]?task:nil;
+}
+static NSTask *(*ChildSpawner)(NSArray<NSString *> *,void(^)(NSTask *))=SpawnChild;
+
 static NSColor *Muted(NSView *view) {
     BOOL dark=[[view.effectiveAppearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua,NSAppearanceNameDarkAqua]]isEqual:NSAppearanceNameDarkAqua];
     return [NSColor colorWithWhite:dark?.94:.08 alpha:.72];
@@ -237,6 +247,7 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
 @property NSInteger writes;
 @property BOOL verifying;
 @property BOOL profiling;
+@property BOOL selftest;
 @property BOOL failed;
 @property double peak;
 @property BOOL originalCaptured;
@@ -246,6 +257,14 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
 @property BOOL expected;
 @property id signalSources;
 @property AutoState iconState;
+@property BOOL inProcessPanel; // verify/profile/tests and the --panel child build the panel here; the icon process spawns it
+@property NSTask *panelTask;
+@property NSArray<NSString *> *panelArguments; // set only in the panel child (`--panel`)
+@property NSRect forcedAnchor;
+@property BOOL hasForcedAnchor;
+@property CGFloat forcedTop,forcedMinX,forcedMaxX; // the icon process's screen area, so both agree on placement
+@property (copy) NSString *lastMessage;
+@property (copy) NSString *pendingMessage;
 @property NSTask *hoverTask; // the child process showing the delayed name/description label
 @property NSArray<NSString *> *hoverArguments; // set only in the child (`--hover`)
 @property NSPanel *hoverWindow;
@@ -261,6 +280,7 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
     (void)note;
     if(self.hoverArguments){[self runHoverChild:self.hoverArguments];return;}
+    if(self.panelArguments){[self runPanelChild:self.panelArguments];return;}
     self.item=[[NSStatusBar systemStatusBar]statusItemWithLength:NSSquareStatusItemLength];
     self.item.button.target=self;self.item.button.action=@selector(statusClicked:);
     [self.item.button sendActionOn:NSEventMaskLeftMouseUp|NSEventMaskRightMouseUp];
@@ -268,10 +288,10 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     self.item.button.accessibilityCustomActions=@[[[NSAccessibilityCustomAction alloc]initWithName:@"Show options" target:self selector:@selector(showOptions:)]];
     self.item.autosaveName=@"AutoBrightness";self.item.visible=YES;
     [self.item.button addTrackingArea:[[NSTrackingArea alloc]initWithRect:NSZeroRect options:NSTrackingMouseEnteredAndExited|NSTrackingActiveAlways|NSTrackingInVisibleRect owner:self userInfo:nil]];
-    if(!self.verifying && !self.profiling)[self registerLoginItem];
+    if(!self.verifying && !self.profiling && !self.selftest)[self registerLoginItem];
     [self updateIcon];[self refresh]; // the icon must show the real setting from the start
-    if(self.verifying || self.profiling) {
-        [self performSelector:self.profiling?@selector(profileOpen):@selector(beginVerification) withObject:nil afterDelay:3];
+    if(self.verifying || self.profiling || self.selftest) {
+        [self performSelector:self.selftest?@selector(beginSelftest):self.profiling?@selector(profileOpen):@selector(beginVerification) withObject:nil afterDelay:3];
     }
 }
 - (void)applicationWillTerminate:(NSNotification *)note { (void)note;[self restoreOriginal]; }
@@ -310,12 +330,15 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     }
 }
 - (void)apply:(BOOL)enabled message:(NSString *)message unsupported:(BOOL)unsupported known:(BOOL)known {
+    if(!message&&self.pendingMessage){message=self.pendingMessage;} // a failure the icon process wants explained
+    self.pendingMessage=nil;self.lastMessage=message;
     self.busy=NO;self.view.working=NO;self.view.message=message;
     self.iconState=unsupported?AutoUnsupported:!known?AutoUnreadable:enabled?AutoOn:AutoOff;
     self.view.state=self.iconState;
     [self updateIcon];[self render];
 }
 - (void)updateIcon {
+    if(!self.item)return; // the panel child has no icon
     static NSImage *images[3];
     int variant=self.iconState==AutoOn?1:self.iconState==AutoOff?0:2;
     if(!images[variant])images[variant]=StatusIcon(variant==1?SunFilled:SunRing,variant==2?.45:1);
@@ -332,7 +355,7 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     [self click:fromButton && (event.type==NSEventTypeRightMouseUp || (event.modifierFlags&NSEventModifierFlagControl))];
 }
 - (void)click:(BOOL)secondary {
-    if(self.panel.visible){[self closePanel:nil];return;}
+    if(self.panelOpen){[self closePanel:nil];return;}
     if(secondary||self.iconState==AutoUnsupported||self.iconState==AutoUnreadable)[self openPanel:YES];
     else if(self.iconState==AutoChecking)[self refresh];
     else [self change:YES to:NO];
@@ -367,16 +390,38 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
             NSString *message=issue?:readIssue;
             if(message&&!self.panel)[self makePanel];
             [self apply:enabled message:message unsupported:unsupported known:readIssue==nil];
-            if(message&&!self.panel.visible)[self openPanel:NO]; // a failed menu bar click explains itself
+            if(message&&!self.panelOpen)[self openPanel:NO]; // a failed menu bar click explains itself
         });
     });
 }
 - (void)toggleAuto:(id)sender { (void)sender;[self change:NO to:!self.view.toggle.on]; }
 
 - (void)togglePanel:(id)sender {
-    (void)sender;if(self.panel.visible){[self closePanel:nil];return;}
+    (void)sender;if(self.panelOpen){[self closePanel:nil];return;}
     [self openPanel:YES];
 }
+#pragma mark - Panel process
+- (BOOL)panelOpen { return self.panelTask!=nil || self.panel.visible; }
+// The panel lives in a short-lived copy of this executable (`--panel`) so its window and drawing
+// memory never grow the icon process. Quit exits that child with PanelQuitStatus.
+- (void)launchPanel:(NSString *)message {
+    NSScreen *screen=nil;NSRect anchor=[self iconAnchor:&screen];NSRect area=screen.visibleFrame;
+    NSMutableArray *arguments=[@[@"--panel",@(NSMidX(anchor)).stringValue,@(NSMaxY(area)).stringValue,@(NSMinX(area)).stringValue,@(NSMaxX(area)).stringValue,
+        @(anchor.origin.x).stringValue,@(anchor.origin.y).stringValue,@(anchor.size.width).stringValue,@(anchor.size.height).stringValue]mutableCopy];
+    if(message)[arguments addObject:message];
+    __weak AutoApp *weakSelf=self;__block NSTask *launched=nil;
+    launched=ChildSpawner(arguments,^(NSTask *task){
+        dispatch_async(dispatch_get_main_queue(),^{
+            AutoApp *app=weakSelf;if(!app||app.panelTask!=task)return;
+            app.panelTask=nil;[app.item.button highlight:NO];
+            if(PanelExitMeansQuit(task)){[NSApp terminate:nil];return;}
+            [app refresh]; // the panel may have changed the setting
+        });
+    });
+    self.panelTask=launched;
+    if(launched)[self.item.button highlight:YES];
+}
+
 #pragma mark - Launch at login
 // Registers the app as a login item once, when it runs from an Applications folder. Apple's
 // SMAppService is loaded only for that first run; later launches never touch it, so turning
@@ -405,23 +450,18 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
 }
 - (void)mouseEntered:(NSEvent *)event {
     (void)event;[self hideHover];
-    if(!self.panel.visible)[self performSelector:@selector(showHover) withObject:nil afterDelay:.5];
+    if(!self.panelOpen)[self performSelector:@selector(showHover) withObject:nil afterDelay:.5];
 }
 - (void)mouseExited:(NSEvent *)event { (void)event;[self hideHover]; }
-// The label is drawn by a short-lived copy of this executable (`--hover`), because AppKit's Liquid
+// (Hover label and panel children share ChildSpawner.) The label is drawn by a short-lived copy of this executable (`--hover`), because AppKit's Liquid
 // Glass keeps several MB resident in whatever process shows it. The icon process just starts and
 // stops that child; the child also exits by itself after eight seconds.
-static NSTask *SpawnHover(NSArray<NSString *> *arguments) {
-    NSTask *task=[NSTask new];task.executableURL=[NSURL fileURLWithPath:NSBundle.mainBundle.executablePath];task.arguments=arguments;
-    NSError *error=nil;return [task launchAndReturnError:&error]?task:nil;
-}
-static NSTask *(*HoverSpawner)(NSArray<NSString *> *)=SpawnHover;
 - (void)showHover {
-    if(self.hoverTask||self.panel.visible)return;
+    if(self.hoverTask||self.panelOpen)return;
     NSScreen *screen=nil;NSRect anchor=[self iconAnchor:&screen];NSRect area=screen.visibleFrame;
     NSMutableArray *arguments=[@[@"--hover",@(NSMidX(anchor)).stringValue,@(NSMaxY(area)).stringValue,@(NSMinX(area)).stringValue,@(NSMaxX(area)).stringValue]mutableCopy];
     [arguments addObjectsFromArray:self.hoverLines];
-    self.hoverTask=HoverSpawner(arguments);
+    self.hoverTask=ChildSpawner(arguments,nil);
     [self performSelector:@selector(hideHover) withObject:nil afterDelay:8];
 }
 - (void)hideHover {
@@ -460,6 +500,18 @@ static NSTask *(*HoverSpawner)(NSArray<NSString *> *)=SpawnHover;
     [window orderFrontRegardless];
     return window;
 }
+- (void)runPanelChild:(NSArray<NSString *> *)arguments { // arguments: midX top minX maxX anchorX anchorY anchorW anchorH [message]
+    self.inProcessPanel=YES;
+    self.forcedTop=arguments[1].doubleValue;self.forcedMinX=arguments[2].doubleValue;self.forcedMaxX=arguments[3].doubleValue;
+    self.forcedAnchor=NSMakeRect(arguments[4].doubleValue,arguments[5].doubleValue,arguments[6].doubleValue,arguments[7].doubleValue);self.hasForcedAnchor=YES;
+    if(arguments.count>8)self.pendingMessage=arguments[8];
+    [self openPanel:YES];
+    // Clicks on the icon belong to the icon process, which closes this panel itself.
+    __weak AutoApp *weakSelf=self;
+    [NSEvent removeMonitor:self.globalMonitor];
+    self.globalMonitor=[NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown|NSEventMaskRightMouseDown handler:^(NSEvent *e){(void)e;
+        if(!NSPointInRect(NSEvent.mouseLocation,NSInsetRect(weakSelf.forcedAnchor,-2,-2)))[weakSelf closePanel:nil];}];
+}
 - (void)runHoverChild:(NSArray<NSString *> *)arguments { // arguments: midX top minX maxX line1 line2 line3
     self.hoverWindow=[self makeHoverWindow:[arguments subarrayWithRange:NSMakeRange(4,arguments.count-4)] midX:arguments[0].doubleValue top:arguments[1].doubleValue minX:arguments[2].doubleValue maxX:arguments[3].doubleValue];
     [NSApp performSelector:@selector(terminate:) withObject:nil afterDelay:8];
@@ -467,6 +519,11 @@ static NSTask *(*HoverSpawner)(NSArray<NSString *> *)=SpawnHover;
 
 // Where the menu bar icon is on screen, and which screen it is on.
 - (NSRect)iconAnchor:(NSScreen **)screenOut {
+    if(self.hasForcedAnchor){ // the panel child is told where the icon is
+        NSScreen *found=NSScreen.mainScreen;
+        for(NSScreen *candidate in NSScreen.screens)if(NSPointInRect(NSMakePoint(NSMidX(self.forcedAnchor),NSMidY(self.forcedAnchor)),candidate.frame)){found=candidate;break;}
+        *screenOut=found;return self.forcedAnchor;
+    }
     NSButton *button=self.item.button;NSRect anchor=[button.window convertRectToScreen:[button convertRect:button.bounds toView:nil]];
     NSScreen *screen=button.window.screen?:NSScreen.mainScreen;
     NSPoint pointer=NSEvent.mouseLocation;
@@ -478,13 +535,16 @@ static NSTask *(*HoverSpawner)(NSArray<NSString *> *)=SpawnHover;
     *screenOut=screen;return anchor;
 }
 - (void)openPanel:(BOOL)refreshing {
-    if(self.panel.visible)return;
+    if(self.panelOpen)return;
     [self hideHover];
+    if(!self.inProcessPanel){[self launchPanel:refreshing?nil:self.lastMessage];return;}
     self.generation++;
     if(!self.panel)[self makePanel];
     NSButton *button=self.item.button;NSScreen *screen=nil;NSRect anchor=[self iconAnchor:&screen];
-    CGFloat x=fmin(fmax(NSMidX(anchor)-PanelWidth/2,NSMinX(screen.visibleFrame)+8),NSMaxX(screen.visibleFrame)-PanelWidth-8);
-    [self.panel setFrameOrigin:NSMakePoint(x,NSMaxY(screen.visibleFrame)-PanelHeight-6)];
+    CGFloat minX=NSMinX(screen.visibleFrame),maxX=NSMaxX(screen.visibleFrame),top=NSMaxY(screen.visibleFrame);
+    if(self.hasForcedAnchor){minX=self.forcedMinX;maxX=self.forcedMaxX;top=self.forcedTop;}
+    CGFloat x=fmin(fmax(NSMidX(anchor)-PanelWidth/2,minX+8),maxX-PanelWidth-8);
+    [self.panel setFrameOrigin:NSMakePoint(x,top-PanelHeight-6)];
     self.view.needsDisplay=YES;
     [self.panel makeKeyAndOrderFront:nil];
     [self.panel makeFirstResponder:self.view.toggle.acceptsFirstResponder?self.view.toggle:nil];
@@ -505,16 +565,25 @@ static NSTask *(*HoverSpawner)(NSArray<NSString *> *)=SpawnHover;
     if(refreshing)[self refresh];
 }
 - (void)closePanel:(id)sender {
-    (void)sender;[self.panel orderOut:nil];[self.item.button highlight:NO];
+    (void)sender;
+    if(self.panelTask){[self.panelTask terminate];return;} // the exit handler clears it and refreshes
+    [self.panel orderOut:nil];[self.item.button highlight:NO];
     if(self.globalMonitor){[NSEvent removeMonitor:self.globalMonitor];self.globalMonitor=nil;}
     if(self.localMonitor){[NSEvent removeMonitor:self.localMonitor];self.localMonitor=nil;}
     // The window and its drawing surface are the app's largest allocation; free them while idle.
     // Deferred so a control that closed the panel from its own event handler finishes first.
     NSInteger generation=++self.generation;
     if(!self.retainPanel)dispatch_async(dispatch_get_main_queue(),^{if(generation==self.generation){self.panel=nil;self.view=nil;malloc_zone_pressure_relief(NULL,0);}});
+    if(self.panelArguments)[NSApp terminate:nil]; // the panel child lives only while the panel is open
 }
-- (void)openSettings:(id)sender { (void)sender;[self closePanel:nil];[[NSWorkspace sharedWorkspace]openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.Displays-Settings.extension"]]; }
-- (void)quit:(id)sender { (void)sender;[self closePanel:nil];[NSApp terminate:nil]; }
+- (void)openSettings:(id)sender {
+    (void)sender;[self.panel orderOut:nil];
+    // The panel child must outlive the request, so close only once macOS has accepted it.
+    [[NSWorkspace sharedWorkspace]openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.Displays-Settings.extension"] configuration:[NSWorkspaceOpenConfiguration configuration] completionHandler:^(NSRunningApplication *app,NSError *error){
+        (void)app;(void)error;dispatch_async(dispatch_get_main_queue(),^{[self closePanel:nil];});
+    }];
+}
+- (void)quit:(id)sender { (void)sender;if(self.panelArguments)exit(PanelQuitStatus);[self closePanel:nil];[NSApp terminate:nil]; }
 
 #pragma mark - Verification (--verify changes the real setting and always restores it; --profile only reads)
 - (void)sample { double current=Footprint(),value=fmax(current,KernelPeak);if(value>self.peak)self.peak=value; }
@@ -537,6 +606,21 @@ static NSTask *(*HoverSpawner)(NSArray<NSString *> *)=SpawnHover;
 - (BOOL)independentRead:(BOOL *)value {
     return ReadAuto(FindDisplay(),value,NULL)==nil;
 }
+// Snapshots the current value (restored on every exit path) and arranges restore on termination signals.
+- (BOOL)captureOriginal {
+    BOOL value=NO;NSString *issue=ReadAuto(FindDisplay(),&value,NULL);
+    if(issue){fprintf(stderr,"Verification unavailable: %s\n",issue.UTF8String);self.failed=YES;return NO;}
+    self.originalCaptured=YES;self.original=value;self.expected=value;self.originalDisplay=FindDisplay();
+    NSMutableArray *sources=[NSMutableArray array];
+    for(NSNumber *sig in @[@SIGINT,@SIGTERM,@SIGHUP]) {
+        signal(sig.intValue,SIG_IGN);
+        dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL,sig.intValue,0,dispatch_get_main_queue());
+        dispatch_source_set_event_handler(source,^{self.failed=YES;[self finishVerification];});dispatch_resume(source);[sources addObject:source];
+    }
+    self.signalSources=sources;
+    printf("Original: automatic brightness %s\n",value?"on":"off");fflush(stdout);
+    return YES;
+}
 - (void)beginVerification {
     printf("Idle: %.3f MB\n",Footprint());fflush(stdout);
     // The hover label is a real child process: it must start, stay up, and stop on request.
@@ -544,21 +628,54 @@ static NSTask *(*HoverSpawner)(NSArray<NSString *> *)=SpawnHover;
     printf("hover child: %s; footprint %.3f MB\n",up?"started":"FAILED to start",Footprint());if(!up)self.failed=YES;
     [self togglePanel:nil];
     [self whenIdle:^{
-        BOOL value=NO;NSString *issue=ReadAuto(FindDisplay(),&value,NULL);
-        if(issue){fprintf(stderr,"Verification unavailable: %s\n",issue.UTF8String);self.failed=YES;[self finishVerification];return;}
-        self.originalCaptured=YES;self.original=value;self.expected=value;self.originalDisplay=FindDisplay();
-        // Restore on any ordinary termination signal as well as on normal exit.
-        NSMutableArray *sources=[NSMutableArray array];
-        for(NSNumber *sig in @[@SIGINT,@SIGTERM,@SIGHUP]) {
-            signal(sig.intValue,SIG_IGN);
-            dispatch_source_t s=dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL,sig.intValue,0,dispatch_get_main_queue());
-            dispatch_source_set_event_handler(s,^{self.failed=YES;[self finishVerification];});dispatch_resume(s);[sources addObject:s];
-        }
-        self.signalSources=sources;
-        printf("Original: automatic brightness %s; panel=%s; window=%ld\n",value?"on":"off",NSStringFromRect(self.panel.frame).UTF8String,(long)self.panel.windowNumber);fflush(stdout);
+        if(![self captureOriginal]){[self finishVerification];return;}
+        printf("panel=%s; window=%ld\n",NSStringFromRect(self.panel.frame).UTF8String,(long)self.panel.windowNumber);fflush(stdout);
         [self.panel makeKeyWindow];[self.panel makeFirstResponder:self.view.toggle];
         [self verificationStep];
     }];
+}
+// --selftest: the icon process exactly as shipped (no in-process panel), driven through its real
+// click, hover and panel-child paths. Its footprint is the app-process figure that matters.
+- (void)waitFor:(BOOL(^)(void))condition seconds:(double)seconds then:(dispatch_block_t)block {
+    if(self.finished)return;
+    if(condition()){block();return;}
+    if(seconds<=0){self.failed=YES;fputs("Timed out.\n",stderr);[self finishVerification];return;}
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,50*NSEC_PER_MSEC),dispatch_get_main_queue(),^{[self waitFor:condition seconds:seconds-.05 then:block];});
+}
+- (void)beginSelftest {
+    printf("Idle: %.3f MB (icon process, as shipped)\n",Footprint());fflush(stdout);
+    [self waitFor:^BOOL{return !self.busy;} seconds:5 then:^{
+        if(![self captureOriginal]){[self finishVerification];return;}
+        [self selftestStep];
+    }];
+}
+- (void)selftestStep {
+    if(self.finished)return;
+    int n=self.cycle++;
+    void(^next)(void)=^{[self sample];[self performSelector:@selector(selftestStep) withObject:nil afterDelay:.5];};
+    if(n<2) { // menu bar clicks through the real button action
+        [self.item.button performClick:nil];self.expected=!self.expected;
+        [self waitFor:^BOOL{return !self.busy;} seconds:5 then:^{
+            BOOL actual=NO;BOOL ok=[self independentRead:&actual]&&actual==self.expected&&self.iconState==(self.expected?AutoOn:AutoOff);
+            if(!ok)self.failed=YES;
+            printf("menu bar click %d (%s): %s; %.3f MB\n",n,self.expected?"on":"off",ok?"verified by independent read":"FAILED",Footprint());fflush(stdout);next();
+        }];
+    } else if(n==2) { // hover label child
+        [self showHover];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,1*NSEC_PER_SEC),dispatch_get_main_queue(),^{
+            BOOL up=self.hoverTask.isRunning;[self hideHover];if(!up)self.failed=YES;
+            printf("hover child: %s; %.3f MB\n",up?"ran":"FAILED",Footprint());fflush(stdout);next();
+        });
+    } else if(n<6) { // panel child: open, stay up, close on request
+        [self showOptions:nil];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.5*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
+            BOOL up=self.panelTask.isRunning;[self closePanel:nil];
+            [self waitFor:^BOOL{return self.panelTask==nil&&!self.busy;} seconds:5 then:^{
+                if(!up)self.failed=YES;
+                printf("panel child %d: %s and closed; %.3f MB\n",n-2,up?"ran":"FAILED",Footprint());fflush(stdout);next();
+            }];
+        });
+    } else [self finishVerification];
 }
 - (void)pressSpace {
     NSEvent *space=[NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:self.panel.windowNumber context:nil characters:@" " charactersIgnoringModifiers:@" " isARepeat:NO keyCode:49];
@@ -626,6 +743,12 @@ int main(int argc,const char **argv) {
             if(issue){fprintf(stderr,"%s: %s\n",unsupported?"Unsupported":"Error",issue.UTF8String);return 1;}
             printf("Automatic brightness: %s\n",enabled?"on":"off");return 0;
         }
+        if(argc>=10 && strcmp(argv[1],"--panel")==0) { // panel child: no lock, no status item
+            NSMutableArray *arguments=[NSMutableArray array];
+            for(int i=2;i<argc;i++)[arguments addObject:[NSString stringWithUTF8String:argv[i]]];
+            NSApplication *app=NSApplication.sharedApplication;[app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+            AutoApp *delegate=[AutoApp new];delegate.panelArguments=arguments;app.delegate=delegate;[app run];return 0;
+        }
         if(argc>=9 && strcmp(argv[1],"--hover")==0) { // label child: no lock, no status item
             NSMutableArray *arguments=[NSMutableArray array];
             for(int i=2;i<argc;i++)[arguments addObject:[NSString stringWithUTF8String:argv[i]]];
@@ -634,13 +757,14 @@ int main(int argc,const char **argv) {
         }
         BOOL verify=argc==2 && strcmp(argv[1],"--verify")==0;
         BOOL profile=argc==2 && strcmp(argv[1],"--profile")==0;
-        if(argc!=1 && !verify && !profile){fprintf(stderr,"Usage: AutoBrightness [--diagnose | --profile | --verify (changes and restores the real setting)]\n");return 2;}
+        BOOL selftest=argc==2 && strcmp(argv[1],"--selftest")==0;
+        if(argc!=1 && !verify && !profile && !selftest){fprintf(stderr,"Usage: AutoBrightness [--diagnose | --profile | --verify | --selftest]  (--verify and --selftest change and restore the real setting)\n");return 2;}
         NSString *lockPath=[NSTemporaryDirectory()stringByAppendingPathComponent:@"local.amogh.AutoBrightness.lock"];
         int lock=open(lockPath.fileSystemRepresentation,O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW,0600);
         if(lock<0){perror("AutoBrightness lock");return 1;}
-        if(flock(lock,LOCK_EX|LOCK_NB)!=0){int reason=errno;close(lock);if(reason==EWOULDBLOCK){if(verify||profile){fputs("Another AutoBrightness is running; quit it first.\n",stderr);return 1;}return 0;}errno=reason;perror("AutoBrightness lock");return 1;}
+        if(flock(lock,LOCK_EX|LOCK_NB)!=0){int reason=errno;close(lock);if(reason==EWOULDBLOCK){if(verify||profile||selftest){fputs("Another AutoBrightness is running; quit it first.\n",stderr);return 1;}return 0;}errno=reason;perror("AutoBrightness lock");return 1;}
         NSApplication *app;AutoApp *delegate;
-        @autoreleasepool { app=NSApplication.sharedApplication;[app setActivationPolicy:NSApplicationActivationPolicyAccessory];delegate=[AutoApp new];delegate.verifying=verify;delegate.profiling=profile;app.delegate=delegate; }
+        @autoreleasepool { app=NSApplication.sharedApplication;[app setActivationPolicy:NSApplicationActivationPolicyAccessory];delegate=[AutoApp new];delegate.verifying=verify;delegate.profiling=profile;delegate.selftest=selftest;delegate.inProcessPanel=verify||profile;app.delegate=delegate; }
         [app run];return delegate.failed?1:0;
     }
 }
