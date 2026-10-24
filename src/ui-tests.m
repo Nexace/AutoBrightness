@@ -24,6 +24,14 @@ static uint8_t AlphaAt(NSView *view, CGFloat x, CGFloat y) {
     return alpha;
 }
 
+static NSInteger spawns;
+static NSArray *spawned;
+static NSTask *StubSpawn(NSArray<NSString *> *arguments) { // a harmless long-running stand-in for the label child
+    spawns++; spawned = arguments;
+    NSTask *task = [NSTask new]; task.executableURL = [NSURL fileURLWithPath:@"/bin/sleep"]; task.arguments = @[@"30"];
+    return [task launchAndReturnError:nil] ? task : nil;
+}
+
 int main(void) { @autoreleasepool {
     [NSApplication.sharedApplication setActivationPolicy:NSApplicationActivationPolicyAccessory];
     FindDisplay = FakeDisplay;
@@ -109,6 +117,41 @@ int main(void) { @autoreleasepool {
     FakeHas = 0; [app refresh]; Settle(app); [app click:NO]; assert(app.panel.visible && view.state == AutoUnsupported);
     [app click:NO]; FakeHas = 1; [app refresh]; Settle(app);
     assert([app showOptions:nil] && app.panel.visible); Settle(app); [app closePanel:nil];
+
+    // Hover label: lines, spawn/stop of the child, and the window it draws (glass or opaque card).
+    assert([app.hoverLines[1] isEqual:@"Automatic brightness: On"] && [app.hoverLines[2] hasPrefix:@"Click to turn off"]);
+    app.iconState = AutoOff; assert([app.hoverLines[2] hasPrefix:@"Click to turn on"]);
+    app.iconState = AutoUnsupported; assert([app.hoverLines[1] hasSuffix:@"unavailable"] && [app.hoverLines[2] isEqual:@"Right-click for options"]);
+    app.iconState = AutoOn;
+    HoverSpawner = StubSpawn;
+    [app showHover]; assert(spawns == 1 && app.hoverTask.isRunning && [spawned[0] isEqual:@"--hover"] && spawned.count == 8 && [spawned[5] isEqual:@"AutoBrightness"]);
+    NSTask *task = app.hoverTask;
+    [app showHover]; assert(spawns == 1); // one label at a time
+    [app hideHover]; assert(!app.hoverTask); Pump(^BOOL{ return !task.isRunning; });
+    [app mouseEntered:nil]; assert(spawns == 1); // appears only after the delay
+    Pump(^BOOL{ return spawns == 2; });
+    [app mouseExited:nil]; assert(!app.hoverTask);
+    [app mouseEntered:nil]; [app mouseExited:nil];
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.7]]; assert(spawns == 2); // left before the delay
+    [app showHover]; [app statusClicked:nil]; assert(!app.hoverTask); Settle(app); // a click dismisses it, then toggles
+    [app click:NO]; Settle(app); assert(app.iconState == AutoOn && FakeByte == 1); // toggle back
+    [app showHover]; [app click:YES]; assert(!app.hoverTask && app.panel.visible); [app closePanel:nil];
+    [app showHover]; [app openPanel:NO]; assert(!app.hoverTask); [app closePanel:nil];
+    HoverSpawner = SpawnHover;
+    ReduceTransparencyOverride = 0;
+    NSPanel *label = [app makeHoverWindow:app.hoverLines midX:500 top:900 minX:0 maxX:1000];
+    assert(label.visible && [label.contentView isKindOfClass:NSGlassEffectView.class]); // native Liquid Glass
+    NSView *labels = ((NSGlassEffectView *)label.contentView).contentView;
+    assert(labels.subviews.count == 3 && [[(NSTextField *)labels.subviews[0] stringValue] isEqual:@"AutoBrightness"]);
+    assert([[(NSTextField *)labels.subviews[0] font] isEqual:[NSFont preferredFontForTextStyle:NSFontTextStyleHeadline options:@{}]]); // Apple text style
+    assert(fabs(NSMidX(label.frame) - 500) < 1 && NSMaxY(label.frame) < 900);
+    [label orderOut:nil];
+    ReduceTransparencyOverride = 1; // opaque card instead of glass
+    label = [app makeHoverWindow:app.hoverLines midX:500 top:900 minX:0 maxX:1000];
+    assert(![label.contentView isKindOfClass:NSGlassEffectView.class] && label.contentView.subviews.count == 3); [label orderOut:nil];
+    label = [app makeHoverWindow:app.hoverLines midX:5 top:900 minX:0 maxX:1000]; // clamped to the screen edge
+    assert(NSMinX(label.frame) >= 8); [label orderOut:nil];
+    ReduceTransparencyOverride = -1;
 
     // Panel placement and dismissal: Escape, outside click, and the status item toggle.
     [app togglePanel:nil]; assert(app.panel.visible);

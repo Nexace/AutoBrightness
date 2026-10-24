@@ -10,12 +10,17 @@ Open **AutoBrightness.app**. A sun appears in the menu bar:
 
 - **Left-click:** turn automatic brightness on or off immediately.
 - **Filled sun:** on. **Outline sun:** off. A faded outline means the setting can't be read or isn't available.
+- **Hover:** rest the pointer on the icon for half a second and a small native Liquid Glass label (Apple's system font and text styles) shows the name, the current state and what a click does. It disappears when the pointer leaves, on click, or after eight seconds. It is drawn by a short-lived copy of the same executable (`--hover`) so the Liquid Glass memory stays out of the icon process; Reduce Transparency gives an opaque card instead.
 - **Right-click** (or Control-click, or the VoiceOver "Show options" action): a frosted panel opens under the icon with the **Automatic brightness** switch, a short explanation, **Displays Settings…** and **Quit**. Click outside, press Escape, or click the icon again to dismiss it. Space or Return operates the focused control, Tab moves between them.
 - If a left-click can't change the setting, or the Mac has no ambient light sensor, the panel opens and says why. On an unsupported Mac there is no switch, only a button that opens Displays settings.
 
-Every change is confirmed by reading the setting back from macOS before the icon or switch moves, and a second change is ignored while one is in flight. macOS does the ambient light sensing itself; the app does nothing in the background. It asks for no Accessibility, Screen Recording or administrator permission, makes no network requests, and has no login item or helper. It controls only this one setting for the built-in display — no keyboard backlight, True Tone, Night Shift, external displays, schedules, thresholds or brightness slider.
+Every change is confirmed by reading the setting back from macOS before the icon or switch moves, and a second change is ignored while one is in flight. macOS does the ambient light sensing itself; the app does nothing in the background. It asks for no Accessibility, Screen Recording or administrator permission and makes no network requests. There is no helper process: the only other process is the short-lived hover label, a second launch of the same executable. It controls only this one setting for the built-in display — no keyboard backlight, True Tone, Night Shift, external displays, schedules, thresholds or brightness slider.
 
 The icon reflects the setting as of launch, the last panel open, or the last click. There is no polling, so a change made in System Settings shows up on the next click or panel open (a click always flips the real current value).
+
+## Runs in the background, starts at login
+
+AutoBrightness has no Dock icon or window; it just lives in the menu bar. **`./install.sh`** builds it, copies it to `/Applications` and opens it. The first time it runs from an Applications folder it registers itself as a login item with Apple's `SMAppService` (once, remembered in its preferences), so it starts every time you log in. macOS may show a "Login Item added" notice. To stop it, switch it off in System Settings → General → Login Items & Extensions; the app will not re-enable it. Runs from the build folder never register.
 
 ## Build and run
 
@@ -25,6 +30,7 @@ Needs Apple silicon, macOS 26.4 or newer and Apple's command-line developer tool
 ./build.sh      # builds and ad-hoc signs AutoBrightness.app (icon is generated from drawing code)
 ./test.sh       # backend + UI checks against a fake backend; never touches the real setting
 open AutoBrightness.app
+./install.sh    # build + install to /Applications + start (registers the login item)
 ```
 
 Diagnostics on the built executable:
@@ -47,7 +53,7 @@ Apple documents the setting only as a checkbox; there is no public API. The app 
 
 **The 8.00 MB footprint target is not met.** Measured through LaunchServices on this Mac: a plain launch (menu bar icon only, setting read) idles at **7.849 MB** with a lifetime peak of **8.144 MB**. After the full `--verify` interaction (panel opened and reopened, keyboard, accessibility and menu-bar-click toggles in both directions) the footprint is **9.209 MB** and the lifetime peak **10.175 MB** (three runs: 10.126–10.241 MB). On this OS an empty accessory app with one `NSStatusItem` already measures 8.08 MB footprint / 8.42 MB peak with the best allocator settings, so a status-item app cannot get under 8 MB here. `research/Memory.md` has the evidence and the allocator A/B; `Verification.log` has the numbers.
 
-Idle CPU over 20 s after the panel closed: 0.003% of one core (0.6 ms total), one idle wakeup, none periodic. No timers, no polling.
+Idle CPU over 20 s: about 0.003% of one core (0.6 ms), a few non-periodic wakeups. No timers, no polling.
 
 ## Files
 

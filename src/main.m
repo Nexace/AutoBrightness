@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <malloc/malloc.h>
+#include <objc/message.h>
 #import "auto.h"
 
 enum { PanelWidth = 260, PanelHeight = 164 };
@@ -245,6 +246,9 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
 @property BOOL expected;
 @property id signalSources;
 @property AutoState iconState;
+@property NSTask *hoverTask; // the child process showing the delayed name/description label
+@property NSArray<NSString *> *hoverArguments; // set only in the child (`--hover`)
+@property NSPanel *hoverWindow;
 @property BOOL finished; // verification is over: no further steps or writes
 @property NSInteger generation; // bumped by every open/close so a stale deferred release is ignored
 @property BOOL retainPanel; // tests keep the panel alive; the app frees it on close
@@ -255,12 +259,16 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     return _queue;
 }
 - (void)applicationDidFinishLaunching:(NSNotification *)note {
-    (void)note;self.item=[[NSStatusBar systemStatusBar]statusItemWithLength:NSSquareStatusItemLength];
+    (void)note;
+    if(self.hoverArguments){[self runHoverChild:self.hoverArguments];return;}
+    self.item=[[NSStatusBar systemStatusBar]statusItemWithLength:NSSquareStatusItemLength];
     self.item.button.target=self;self.item.button.action=@selector(statusClicked:);
     [self.item.button sendActionOn:NSEventMaskLeftMouseUp|NSEventMaskRightMouseUp];
     self.item.button.accessibilityLabel=@"Automatic brightness";
     self.item.button.accessibilityCustomActions=@[[[NSAccessibilityCustomAction alloc]initWithName:@"Show options" target:self selector:@selector(showOptions:)]];
     self.item.autosaveName=@"AutoBrightness";self.item.visible=YES;
+    [self.item.button addTrackingArea:[[NSTrackingArea alloc]initWithRect:NSZeroRect options:NSTrackingMouseEnteredAndExited|NSTrackingActiveAlways|NSTrackingInVisibleRect owner:self userInfo:nil]];
+    if(!self.verifying && !self.profiling)[self registerLoginItem];
     [self updateIcon];[self refresh]; // the icon must show the real setting from the start
     if(self.verifying || self.profiling) {
         [self performSelector:self.profiling?@selector(profileOpen):@selector(beginVerification) withObject:nil afterDelay:3];
@@ -315,11 +323,11 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     NSString *state=self.iconState==AutoOn?@"On":self.iconState==AutoOff?@"Off":@"Unavailable";
     button.accessibilityValueDescription=state;
     if(button)NSAccessibilityPostNotification(button,NSAccessibilityValueChangedNotification);
-    button.toolTip=self.iconState==AutoOn?@"Automatic brightness: on. Click to turn off; right-click for options.":self.iconState==AutoOff?@"Automatic brightness: off. Click to turn on; right-click for options.":@"Automatic brightness. Right-click for options.";
+    button.accessibilityHelp=self.hoverLines[2];
 }
 // Left click changes the setting directly; right/Control click, or the accessibility action, opens the panel.
 - (void)statusClicked:(id)sender {
-    (void)sender;NSEvent *event=NSApp.currentEvent;
+    (void)sender;[self hideHover];NSEvent *event=NSApp.currentEvent;
     BOOL fromButton=event.window==self.item.button.window; // an accessibility press can leave a stale event
     [self click:fromButton && (event.type==NSEventTypeRightMouseUp || (event.modifierFlags&NSEventModifierFlagControl))];
 }
@@ -369,10 +377,96 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     (void)sender;if(self.panel.visible){[self closePanel:nil];return;}
     [self openPanel:YES];
 }
-- (void)openPanel:(BOOL)refreshing {
-    if(self.panel.visible)return;
-    self.generation++;
-    if(!self.panel)[self makePanel];
+#pragma mark - Launch at login
+// Registers the app as a login item once, when it runs from an Applications folder. Apple's
+// SMAppService is loaded only for that first run; later launches never touch it, so turning
+// the item off in System Settings → General → Login Items is respected.
+- (void)registerLoginItem {
+    NSString *path=NSBundle.mainBundle.bundlePath;
+    if(![path hasPrefix:@"/Applications/"] && ![path hasPrefix:[NSHomeDirectory() stringByAppendingPathComponent:@"Applications/"]])return;
+    NSUserDefaults *defaults=NSUserDefaults.standardUserDefaults;
+    if([defaults boolForKey:@"LoginItemRequested"])return;
+    if(!dlopen("/System/Library/Frameworks/ServiceManagement.framework/ServiceManagement",RTLD_LAZY|RTLD_LOCAL))return;
+    Class type=NSClassFromString(@"SMAppService");SEL mainApp=NSSelectorFromString(@"mainAppService");
+    if(!type||![type respondsToSelector:mainApp])return;
+    id service=((id(*)(Class,SEL))objc_msgSend)(type,mainApp);
+    NSError *error=nil;
+    BOOL ok=((BOOL(*)(id,SEL,NSError **))objc_msgSend)(service,NSSelectorFromString(@"registerAndReturnError:"),&error);
+    NSInteger status=((NSInteger(*)(id,SEL))objc_msgSend)(service,NSSelectorFromString(@"status"));
+    if(ok||status==1||status==2)[defaults setBool:YES forKey:@"LoginItemRequested"]; // 1 enabled, 2 needs approval
+    else fprintf(stderr,"Launch at login failed: %s\n",error.localizedDescription.UTF8String);
+}
+
+#pragma mark - Hover label
+- (NSArray<NSString *> *)hoverLines {
+    NSString *state=self.iconState==AutoOn?@"Automatic brightness: On":self.iconState==AutoOff?@"Automatic brightness: Off":@"Automatic brightness: unavailable";
+    NSString *hint=self.iconState==AutoOn?@"Click to turn off · Right-click for options":self.iconState==AutoOff?@"Click to turn on · Right-click for options":@"Right-click for options";
+    return @[@"AutoBrightness",state,hint];
+}
+- (void)mouseEntered:(NSEvent *)event {
+    (void)event;[self hideHover];
+    if(!self.panel.visible)[self performSelector:@selector(showHover) withObject:nil afterDelay:.5];
+}
+- (void)mouseExited:(NSEvent *)event { (void)event;[self hideHover]; }
+// The label is drawn by a short-lived copy of this executable (`--hover`), because AppKit's Liquid
+// Glass keeps several MB resident in whatever process shows it. The icon process just starts and
+// stops that child; the child also exits by itself after eight seconds.
+static NSTask *SpawnHover(NSArray<NSString *> *arguments) {
+    NSTask *task=[NSTask new];task.executableURL=[NSURL fileURLWithPath:NSBundle.mainBundle.executablePath];task.arguments=arguments;
+    NSError *error=nil;return [task launchAndReturnError:&error]?task:nil;
+}
+static NSTask *(*HoverSpawner)(NSArray<NSString *> *)=SpawnHover;
+- (void)showHover {
+    if(self.hoverTask||self.panel.visible)return;
+    NSScreen *screen=nil;NSRect anchor=[self iconAnchor:&screen];NSRect area=screen.visibleFrame;
+    NSMutableArray *arguments=[@[@"--hover",@(NSMidX(anchor)).stringValue,@(NSMaxY(area)).stringValue,@(NSMinX(area)).stringValue,@(NSMaxX(area)).stringValue]mutableCopy];
+    [arguments addObjectsFromArray:self.hoverLines];
+    self.hoverTask=HoverSpawner(arguments);
+    [self performSelector:@selector(hideHover) withObject:nil afterDelay:8];
+}
+- (void)hideHover {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(showHover) object:nil];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideHover) object:nil];
+    [self.hoverTask terminate];self.hoverTask=nil;
+}
+// Child process side: builds the label window (native Liquid Glass, or an opaque card under
+// Reduce Transparency) centered under `midX`, below `top`, clamped to [minX, maxX].
+- (NSPanel *)makeHoverWindow:(NSArray<NSString *> *)lines midX:(CGFloat)midX top:(CGFloat)top minX:(CGFloat)minX maxX:(CGFloat)maxX {
+    NSMutableArray *labels=[NSMutableArray array];CGFloat width=0,height=20;
+    for(NSUInteger i=0;i<lines.count;i++) {
+        NSTextField *label=[NSTextField labelWithString:lines[i]];
+        // Apple's own text styles (SF at the system sizes) rather than hand-picked sizes.
+        label.font=[NSFont preferredFontForTextStyle:i==0?NSFontTextStyleHeadline:i==1?NSFontTextStyleBody:NSFontTextStyleSubheadline options:@{}];
+        label.textColor=i==2?NSColor.secondaryLabelColor:NSColor.labelColor;[label sizeToFit];
+        width=fmax(width,label.frame.size.width);height+=label.frame.size.height+(i?1:0);[labels addObject:label];
+    }
+    width+=28;
+    NSPanel *window=[[NSPanel alloc]initWithContentRect:NSMakeRect(0,0,width,height) styleMask:NSWindowStyleMaskBorderless|NSWindowStyleMaskNonactivatingPanel backing:NSBackingStoreBuffered defer:NO];
+    window.backgroundColor=NSColor.clearColor;window.opaque=NO;window.hasShadow=NO;window.level=NSPopUpMenuWindowLevel;window.ignoresMouseEvents=YES;window.hidesOnDeactivate=NO;
+    NSView *content=[[NSView alloc]initWithFrame:NSMakeRect(0,0,width,height)];
+    if(!ReduceTransparency()) {
+        NSGlassEffectView *glass=[[NSGlassEffectView alloc]initWithFrame:NSMakeRect(0,0,width,height)];
+        glass.cornerRadius=14;glass.contentView=content;window.contentView=glass;window.hasShadow=YES;
+    } else {
+        BOOL dark=[[NSApp.effectiveAppearance bestMatchFromAppearancesWithNames:@[NSAppearanceNameAqua,NSAppearanceNameDarkAqua]]isEqual:NSAppearanceNameDarkAqua];
+        content.wantsLayer=YES;window.contentView=content;
+        content.layer.cornerRadius=14;content.layer.borderWidth=1;
+        content.layer.backgroundColor=[NSColor colorWithWhite:dark?.16:.98 alpha:1].CGColor;
+        content.layer.borderColor=[NSColor colorWithWhite:1 alpha:dark?.23:.66].CGColor;
+    }
+    CGFloat y=height-10;
+    for(NSTextField *label in labels){y-=label.frame.size.height;[label setFrameOrigin:NSMakePoint(14,y)];[content addSubview:label];y-=1;}
+    [window setFrameOrigin:NSMakePoint(fmin(fmax(midX-width/2,minX+8),fmax(minX+8,maxX-width-8)),top-height-6)];
+    [window orderFrontRegardless];
+    return window;
+}
+- (void)runHoverChild:(NSArray<NSString *> *)arguments { // arguments: midX top minX maxX line1 line2 line3
+    self.hoverWindow=[self makeHoverWindow:[arguments subarrayWithRange:NSMakeRange(4,arguments.count-4)] midX:arguments[0].doubleValue top:arguments[1].doubleValue minX:arguments[2].doubleValue maxX:arguments[3].doubleValue];
+    [NSApp performSelector:@selector(terminate:) withObject:nil afterDelay:8];
+}
+
+// Where the menu bar icon is on screen, and which screen it is on.
+- (NSRect)iconAnchor:(NSScreen **)screenOut {
     NSButton *button=self.item.button;NSRect anchor=[button.window convertRectToScreen:[button convertRect:button.bounds toView:nil]];
     NSScreen *screen=button.window.screen?:NSScreen.mainScreen;
     NSPoint pointer=NSEvent.mouseLocation;
@@ -381,6 +475,14 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
         for(NSScreen *candidate in NSScreen.screens)if(NSPointInRect(pointer,candidate.frame)){screen=candidate;break;}
         anchor=NSMakeRect(pointer.x-11,NSMaxY(screen.visibleFrame),22,22);
     }
+    *screenOut=screen;return anchor;
+}
+- (void)openPanel:(BOOL)refreshing {
+    if(self.panel.visible)return;
+    [self hideHover];
+    self.generation++;
+    if(!self.panel)[self makePanel];
+    NSButton *button=self.item.button;NSScreen *screen=nil;NSRect anchor=[self iconAnchor:&screen];
     CGFloat x=fmin(fmax(NSMidX(anchor)-PanelWidth/2,NSMinX(screen.visibleFrame)+8),NSMaxX(screen.visibleFrame)-PanelWidth-8);
     [self.panel setFrameOrigin:NSMakePoint(x,NSMaxY(screen.visibleFrame)-PanelHeight-6)];
     self.view.needsDisplay=YES;
@@ -436,7 +538,11 @@ typedef NS_ENUM(NSInteger, AutoState) { AutoChecking, AutoOn, AutoOff, AutoUnsup
     return ReadAuto(FindDisplay(),value,NULL)==nil;
 }
 - (void)beginVerification {
-    printf("Idle: %.3f MB\n",Footprint());fflush(stdout);[self togglePanel:nil];
+    printf("Idle: %.3f MB\n",Footprint());fflush(stdout);
+    // The hover label is a real child process: it must start, stay up, and stop on request.
+    [self showHover];sleep(1);BOOL up=self.hoverTask.isRunning;[self hideHover];
+    printf("hover child: %s; footprint %.3f MB\n",up?"started":"FAILED to start",Footprint());if(!up)self.failed=YES;
+    [self togglePanel:nil];
     [self whenIdle:^{
         BOOL value=NO;NSString *issue=ReadAuto(FindDisplay(),&value,NULL);
         if(issue){fprintf(stderr,"Verification unavailable: %s\n",issue.UTF8String);self.failed=YES;[self finishVerification];return;}
@@ -519,6 +625,12 @@ int main(int argc,const char **argv) {
             BOOL enabled=NO,unsupported=NO;NSString *issue=LoadSystemBackend()?:ReadAuto(FindDisplay(),&enabled,&unsupported);
             if(issue){fprintf(stderr,"%s: %s\n",unsupported?"Unsupported":"Error",issue.UTF8String);return 1;}
             printf("Automatic brightness: %s\n",enabled?"on":"off");return 0;
+        }
+        if(argc>=9 && strcmp(argv[1],"--hover")==0) { // label child: no lock, no status item
+            NSMutableArray *arguments=[NSMutableArray array];
+            for(int i=2;i<argc;i++)[arguments addObject:[NSString stringWithUTF8String:argv[i]]];
+            NSApplication *app=NSApplication.sharedApplication;[app setActivationPolicy:NSApplicationActivationPolicyAccessory];
+            AutoApp *delegate=[AutoApp new];delegate.hoverArguments=arguments;app.delegate=delegate;[app run];return 0;
         }
         BOOL verify=argc==2 && strcmp(argv[1],"--verify")==0;
         BOOL profile=argc==2 && strcmp(argv[1],"--profile")==0;

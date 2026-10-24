@@ -26,7 +26,15 @@ LIVE VERIFICATION  (--verify, final build; original = OFF)
   Note: the setting was found "off" before this run although it was "on" at the start of the task; it was not changed by the
   verification (which restores whatever it finds). Cause unknown: a copy of the app with the new click-to-toggle icon was running at the time.
 
-MEMORY (normal LaunchServices launch)
+ADDED: LOGIN ITEM, HOVER LABEL (final build)
+  ./install.sh -> /Applications/AutoBrightness.app registered through SMAppService on first run; `sfltool dumpbtm`:
+    Identifier 2.local.amogh.AutoBrightness, URL /Applications/AutoBrightness.app, Disposition [enabled, allowed, notified].
+    Preference LoginItemRequested=1 (never re-registered, so switching it off in Login Items is respected). Not verified by an actual logout/login.
+  Hover label: unit-checked (lines per state, one child at a time, appears only after 0.5 s, cancelled by exit/click/panel open, glass vs opaque card,
+  clamping, Apple headline text style); live: `--verify` starts a real child, it stays up, and hideHover stops it (no stray process);
+  rendered under the menu bar on the real screen as Liquid Glass with SF text (screenshot inspected). A physical pointer hover was not performed.
+
+MEMORY (normal LaunchServices launch; first block measured before the hover label/login code was added)
   Plain launch, 6 s then 20 s idle, panel never opened:  footprint 7.849 MB, lifetime peak 8.144 MB
   --verify (idle before open / after interaction / lifetime peak):
      8.766 / 9.209 / 10.175 MB   (earlier runs of the same build line: 8.29–8.80 / 9.2 / 10.126–10.241)
@@ -43,3 +51,9 @@ NOT VERIFIED
   Physical VoiceOver run (accessibility roles/actions checked programmatically only); physical right-click/Control-click and
   Reduce Transparency toggled in System Settings (the override path and pixel output were tested); other Macs / macOS versions;
   an external-display-only Mac; kill -9 during --verify cannot restore.
+
+FINAL BUILD AFTER HOVER/LOGIN CHANGES
+  --verify (original = on): all steps verified, busy guard PASS, original restored and read back (on).
+     idle 9.094 / after use 9.438 / lifetime peak 10.634 MB — 8.00 MB target FAILS.
+  Installed plain launches, 6 s then 20 s idle: footprint 8.18–8.39 MB, lifetime peak 8.46–8.62 MB (some runs after a fresh install or with system activity
+  showed 9.8 MB / up to 11.2 MB). CPU 0.0025–0.0034% (0.5–0.7 ms per 20 s); one run during system activity 0.30% (60 ms).
