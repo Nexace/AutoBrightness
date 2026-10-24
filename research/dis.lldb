@@ -1,0 +1,8 @@
+breakpoint set -n main
+run
+expr (void*)dlopen("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", 1)
+disassemble -n DisplayServicesAmbientLightCompensationEnabled
+disassemble -n DisplayServicesEnableAmbientLightCompensation
+disassemble -n DisplayServicesHasAmbientLightCompensation
+kill
+quit

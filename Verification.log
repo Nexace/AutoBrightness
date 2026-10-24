@@ -1,0 +1,45 @@
+AutoBrightness 0.1 (build 1) — macOS 27.0.1 (26A434), MacBook Air Mac17,4 (Apple M5), arm64
+Built-in display id 1: "Liquid Retina Display", has ambient light sensor.
+Decimal MB. Memory = TASK_VM_INFO phys_footprint and kernel lifetime peak. All app runs via LaunchServices (open -n -a).
+Allocator flags in Info.plist LSEnvironment (process-local) — chosen by A/B, see research/Memory.md.
+
+BUILD / CHECKS
+./build.sh: -Wall -Wextra -Werror, ad-hoc signed.   codesign --verify --strict: valid on disk, satisfies Designated Requirement.
+./test.sh (fake backend only; real setting untouched):
+  PASS: unavailable symbols, unsupported Macs, read errors, ABI mismatch (unwritten byte, non-boolean byte, int-sized write),
+        rejected writes, and unconfirmed writes.
+  PASS: both states, press/keyboard/accessibility, busy guard, errors, unsupported state, direct menu-bar click (read-then-flip,
+        failure opens panel, stale icon cannot override real state), panel freed on close and rebuilt, dismissal (Escape, outside
+        click, second click), placement clamped to screen, rendering (transparent corners, translucent body, opaque with Reduce Transparency).
+
+BACKEND EVIDENCE (research/Backend.md)
+Disassembled signatures; same-process, cross-process and system_profiler ("Automatically Adjust Brightness: Yes/No") readback agreed
+in both states; original value restored after each probe.
+
+LIVE VERIFICATION  (--verify, final build; original = OFF)
+  keyboard 0 (on) / accessibility 1 (off) / keyboard 2 (on) / accessibility 3 (off) / keyboard 4 (on) / accessibility 5 (off)
+  menu bar click 6 (on) / menu bar click 7 (off) — each "verified by independent read"
+  busy guard: PASS (second/third change while one in flight ignored; exactly one write)
+  PASS: original setting restored (off) and read back independently.
+  Earlier build, original = ON: same steps, all verified, restored (on).
+  Final independent read after the run: Automatic brightness: off; system_profiler: Automatically Adjust Brightness: No.
+  Note: the setting was found "off" before this run although it was "on" at the start of the task; it was not changed by the
+  verification (which restores whatever it finds). Cause unknown: a copy of the app with the new click-to-toggle icon was running at the time.
+
+MEMORY (normal LaunchServices launch)
+  Plain launch, 6 s then 20 s idle, panel never opened:  footprint 7.849 MB, lifetime peak 8.144 MB
+  --verify (idle before open / after interaction / lifetime peak):
+     8.766 / 9.209 / 10.175 MB   (earlier runs of the same build line: 8.29–8.80 / 9.2 / 10.126–10.241)
+  --profile (read-only; open + five reopens): idle 8.029, panel open 9.176 MB
+  RESULT: 8.00 MB target FAILS (post-interaction lifetime peak 10.175 MB; plain-launch peak 8.144 MB).
+  Cause: empty AppKit app + one NSStatusItem = 8.078 MB footprint / 8.422 MB peak with the same allocator flags (research/Memory.md).
+
+IDLE CPU (20 s, after the panel closed; research/cpu-measure.c)
+  pid=45888 (held after --profile): CPU=0.00299% CPU_time=0.598 ms idle_wakeups=1 interrupt_wakeups=3; activity only at 1 s, 2 s (panel teardown) and 18 s; footprint 9.97 MB, lifetime peak 11.371 MB (profile-mode run).
+  Plain launch: CPU=0.00344% CPU_time=0.688 ms idle_wakeups=1 interrupt_wakeups=2; footprint 7.849 MB, peak 8.144 MB.
+  No periodic wakeups.
+
+NOT VERIFIED
+  Physical VoiceOver run (accessibility roles/actions checked programmatically only); physical right-click/Control-click and
+  Reduce Transparency toggled in System Settings (the override path and pixel output were tested); other Macs / macOS versions;
+  an external-display-only Mac; kill -9 during --verify cannot restore.

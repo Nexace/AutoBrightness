@@ -1,0 +1,8 @@
+.DS_Store
+AutoBrightness.app/
+graphify-out/
+work/
+core
+artwork/*.icns
+artwork/autobrightness-*.png
+!artwork/autobrightness-128.png
